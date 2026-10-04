@@ -22,6 +22,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api/middleware"
 	codexlive "github.com/router-for-me/CLIProxyAPI/v8/internal/client/codex/live"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/controlplane"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/managementasset"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
@@ -37,6 +38,10 @@ import (
 // Server represents the main API server.
 // It encapsulates the Gin engine, HTTP server, handlers, and configuration.
 type Server struct {
+	controlPlane       *controlplane.Store
+	controlPlaneCancel context.CancelFunc
+	controlPlaneDone   chan struct{}
+	controlPlaneErr    error
 	// engine is the Gin web framework engine instance.
 	engine *gin.Engine
 
@@ -229,6 +234,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	// subscribe-config heartbeat connection is healthy.
 	engine.Use(s.homeHeartbeatMiddleware())
 	engine.Use(s.exampleAPIKeySafeModeMiddleware())
+	s.initControlPlane(authManager)
 
 	// Setup routes
 	s.setupRoutes()
@@ -287,6 +293,9 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) Start() error {
 	if s == nil || s.server == nil {
 		return fmt.Errorf("failed to start HTTP server: server not initialized")
+	}
+	if s.controlPlaneErr != nil {
+		return s.controlPlaneErr
 	}
 
 	addr := s.server.Addr
@@ -441,6 +450,13 @@ func (s *Server) Stop(ctx context.Context) error {
 	}
 	if s.codexLiveHandler != nil {
 		s.codexLiveHandler.Close()
+	}
+	if s.controlPlaneCancel != nil {
+		s.controlPlaneCancel()
+		<-s.controlPlaneDone
+		if errClose := s.controlPlane.Close(); errClose != nil {
+			log.WithError(errClose).Error("control-plane close failed")
+		}
 	}
 	if errCloseServer != nil {
 		return fmt.Errorf("failed to shutdown HTTP server: %v", errCloseServer)

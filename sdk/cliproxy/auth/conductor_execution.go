@@ -120,6 +120,12 @@ func preferredExecutionAttemptError(fallback, upstream error) error {
 // Execute performs a non-streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	if m.candidatePolicy.Load() != nil && len(opts.OriginalRequest) == 0 {
+		opts.OriginalRequest = bytes.Clone(req.Payload)
+	}
+	if err := m.admitRequest(ctx, req, opts); err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
 	ctx = cliproxyexecutor.WithRequestProxyURL(ctx, opts.ProxyURL)
 	req, opts = cliproxysession.Enrich(req, opts)
 	normalized := m.normalizeProviders(providers)
@@ -180,6 +186,12 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	if m.candidatePolicy.Load() != nil && len(opts.OriginalRequest) == 0 {
+		opts.OriginalRequest = bytes.Clone(req.Payload)
+	}
+	if err := m.admitRequest(ctx, req, opts); err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
 	ctx = cliproxyexecutor.WithRequestProxyURL(ctx, opts.ProxyURL)
 	req, opts = cliproxysession.Enrich(req, opts)
 	normalized := m.normalizeProviders(providers)
@@ -233,6 +245,12 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 // ExecuteStream performs a streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	if m.candidatePolicy.Load() != nil && len(opts.OriginalRequest) == 0 {
+		opts.OriginalRequest = bytes.Clone(req.Payload)
+	}
+	if err := m.admitRequest(ctx, req, opts); err != nil {
+		return nil, err
+	}
 	ctx = cliproxyexecutor.WithRequestProxyURL(ctx, opts.ProxyURL)
 	req, opts = cliproxysession.Enrich(req, opts)
 	if m.HomeEnabled() {
@@ -592,7 +610,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			execReq = attachResolvedExecutionModelInfo(routing, execReq, auth, routeModel, upstreamModel, restoreExecutionModel)
 			execCtx = syncMetadataSessionToContext(execCtx, execOpts.Metadata)
 			startExec := time.Now()
-			resp, errExec := executor.Execute(execCtx, auth, execReq, execOpts)
+			resp, errExec := m.executeWithLease(execCtx, executor, auth, execReq, execOpts)
 			errExec = markUpstreamExecutionAttemptFromContext(execCtx, errExec)
 			durationExec := time.Since(startExec)
 			if errExec != nil {
@@ -609,7 +627,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					execCtx = newUpstreamAttemptContext(execCtx)
 					execCtx = syncMetadataSessionToContext(execCtx, execOpts.Metadata)
 					startRetry := time.Now()
-					resp, errExec = executor.Execute(execCtx, auth, execReq, execOpts)
+					resp, errExec = m.executeWithLease(execCtx, executor, auth, execReq, execOpts)
 					errExec = markUpstreamExecutionAttemptFromContext(execCtx, errExec)
 					durationRetry := time.Since(startRetry)
 					if errExec != nil {
@@ -665,6 +683,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			}
 			m.MarkResult(execCtx, result)
 			attemptAliasResult := resolveAttemptAliasResult(routing, auth, routeModel, upstreamModel, aliasResult)
+			if errObserve := m.observeResponse(execCtx, auth, execOpts, resp.Payload); errObserve != nil {
+				return cliproxyexecutor.Response{}, wrapRequestStopError(errObserve)
+			}
 			rewriteForceMappedResponse(&resp, attemptAliasResult)
 			return resp, nil
 		}

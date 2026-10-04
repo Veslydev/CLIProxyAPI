@@ -1,0 +1,461 @@
+import crypto from "crypto";
+import { prisma } from "@/lib/db";
+import { buildAvailableModelsFromProxy, extractOAuthModelAliases, fetchModelsDevLimits, getProxyUrl, getInternalProxyUrl, inferModelDefinition, type McpEntry, type ModelDefinition } from "@/lib/config-generators/opencode";
+import { buildOhMyOpenCodeConfig } from "@/lib/config-generators/oh-my-opencode";
+import { buildSlimConfig } from "@/lib/config-generators/oh-my-opencode-slim";
+import { fetchProxyModels, type ProxyModel } from "@/lib/config-generators/shared";
+import { validateFullConfig, type OhMyOpenCodeFullConfig } from "@/lib/config-generators/oh-my-opencode-types";
+import { validateSlimConfig, type OhMyOpenCodeSlimFullConfig } from "@/lib/config-generators/oh-my-opencode-slim-types";
+import type { ConfigData, OAuthAccount } from "@/lib/config-generators/shared";
+import { proxyModelsCache, CACHE_TTL, CACHE_KEYS } from "@/lib/cache";
+import { fetchWithRetry } from "@/lib/fetch-utils";
+
+async function fetchProxyModelsCached(proxyUrl: string, apiKey: string): Promise<ProxyModel[]> {
+  const cacheKey = CACHE_KEYS.proxyModels(proxyUrl, apiKey);
+  const cached = proxyModelsCache.get(cacheKey) as ProxyModel[] | null;
+  if (cached) return cached;
+
+  const models = await fetchProxyModels(proxyUrl, apiKey);
+  proxyModelsCache.set(cacheKey, models, CACHE_TTL.PROXY_MODELS);
+  return models;
+}
+
+interface ManagementFetchParams {
+  path: string;
+}
+
+function stableStringify(obj: unknown): string {
+  if (obj === null || typeof obj !== "object") {
+    return JSON.stringify(obj);
+  }
+  if (Array.isArray(obj)) {
+    return "[" + obj.map(stableStringify).join(",") + "]";
+  }
+  const sortedKeys = Object.keys(obj as Record<string, unknown>).sort();
+  const pairs = sortedKeys.map(
+    (key) =>
+      JSON.stringify(key) + ":" + stableStringify((obj as Record<string, unknown>)[key])
+  );
+  return "{" + pairs.join(",") + "}";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function readStringArray(value: unknown): string[] | null {
+  if (!Array.isArray(value)) return null;
+  const filtered = value.filter((item): item is string => typeof item === "string");
+  return filtered.length > 0 ? filtered : null;
+}
+
+function getFrozenExcludedModels(frozenConfig: unknown): string[] | null {
+  if (!isRecord(frozenConfig)) return null;
+  
+  if (Array.isArray(frozenConfig.excludedModels)) {
+    return readStringArray(frozenConfig.excludedModels);
+  }
+  
+  if (isRecord(frozenConfig.modelPreference)) {
+    const modelPref = frozenConfig.modelPreference;
+    if (Array.isArray(modelPref.excludedModels)) {
+      return readStringArray(modelPref.excludedModels);
+    }
+  }
+  
+  return null;
+}
+
+function getFrozenOverrides(frozenConfig: unknown): OhMyOpenCodeFullConfig | undefined {
+  if (!isRecord(frozenConfig)) return undefined;
+  
+  if (isRecord(frozenConfig.overrides)) {
+    return validateFullConfig(frozenConfig.overrides);
+  }
+  
+  if (isRecord(frozenConfig.agentModelOverride)) {
+    const agentOverride = frozenConfig.agentModelOverride;
+    if (isRecord(agentOverride.overrides)) {
+      return validateFullConfig(agentOverride.overrides);
+    }
+  }
+  
+  return undefined;
+}
+
+async function fetchManagementJson({ path }: ManagementFetchParams) {
+  try {
+    const baseUrl =
+      process.env.CLIPROXYAPI_MANAGEMENT_URL ||
+      "http://cliproxyapi:8317/v0/management";
+    const res = await fetchWithRetry(`${baseUrl}/${path}`, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${process.env.MANAGEMENT_API_KEY}`,
+      },
+      cache: "no-store",
+      timeout: 10000,
+    });
+    if (!res.ok) {
+      await res.body?.cancel();
+      return null;
+    }
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+function extractApiKeyStrings(data: unknown): string[] {
+  if (typeof data !== "object" || data === null) return [];
+  const record = data as Record<string, unknown>;
+  const keys = record["api-keys"];
+  if (!Array.isArray(keys)) return [];
+  return keys.filter((key): key is string => typeof key === "string");
+}
+
+function extractOAuthAccounts(data: unknown): OAuthAccount[] {
+   if (typeof data !== "object" || data === null) return [];
+   const record = data as Record<string, unknown>;
+   const files = record["files"];
+   if (!Array.isArray(files)) return [];
+   return files
+     .filter(
+       (entry): entry is Record<string, unknown> =>
+         typeof entry === "object" && entry !== null && "name" in entry
+     )
+     .map((entry) => ({
+       id: typeof entry.id === "string" ? entry.id : String(entry.name),
+       name: String(entry.name),
+       type: typeof entry.type === "string" ? entry.type : undefined,
+       provider: typeof entry.provider === "string" ? entry.provider : undefined,
+       disabled:
+         typeof entry.disabled === "boolean" ? entry.disabled : undefined,
+     }));
+}
+
+interface CustomProviderEntry {
+  name: string;
+  prefix?: string;
+  "base-url": string;
+  "api-key-entries": Array<{
+    "api-key": string;
+    "proxy-url"?: string;
+  }>;
+  models: Array<{
+    name: string;
+    alias: string;
+  }>;
+  "excluded-models"?: string[];
+  headers?: Record<string, unknown>;
+}
+
+function extractCustomProviders(data: unknown): CustomProviderEntry[] {
+  if (typeof data !== "object" || data === null) return [];
+  const record = data as Record<string, unknown>;
+  const providers = record["openai-compatibility"];
+  if (!Array.isArray(providers)) return [];
+  return providers.filter(
+    (entry): entry is CustomProviderEntry =>
+      typeof entry === "object" &&
+      entry !== null &&
+      "name" in entry &&
+      "base-url" in entry &&
+      "api-key-entries" in entry &&
+      "models" in entry
+  );
+}
+
+interface ConfigBundle {
+  version: string;
+  opencode: Record<string, unknown>;
+  ohMyOpencode: Record<string, unknown> | null;
+  ohMyOpenCodeSlim: Record<string, unknown> | null;
+}
+
+export async function generateConfigBundle(userId: string, syncApiKey?: string | null): Promise<ConfigBundle> {
+  // Phase 1: Fetch management config, auth-files, api-keys, and Prisma data in parallel
+  const [managementConfig, authFilesData, apiKeysData, modelPreference, agentOverride, userApiKey, subscription] = await Promise.all([
+    // Management API calls
+    fetchManagementJson({ path: "config" }),
+    fetchManagementJson({ path: "auth-files" }),
+    fetchManagementJson({ path: "api-keys" }),
+    // Prisma queries
+    prisma.modelPreference.findUnique({ where: { userId } }),
+    prisma.agentModelOverride.findUnique({ where: { userId } }),
+    prisma.userApiKey.findFirst({
+      where: { userId },
+      orderBy: { createdAt: "asc" },
+      select: { id: true, key: true },
+    }),
+    prisma.configSubscription.findUnique({
+      where: { userId },
+      include: { template: true },
+    }),
+  ]);
+
+  // Extract data from management API responses
+  const oauthAccounts = extractOAuthAccounts(authFilesData);
+  const apiKeyStrings = extractApiKeyStrings(apiKeysData);
+  const customProviders = extractCustomProviders(managementConfig);
+
+  // 6. Parse frozen config if subscription exists
+  const frozenExcludedModels = subscription?.frozenConfig 
+    ? getFrozenExcludedModels(subscription.frozenConfig)
+    : null;
+  const frozenOverrides = subscription?.frozenConfig
+    ? getFrozenOverrides(subscription.frozenConfig)
+    : undefined;
+  
+  // 7. Check if subscription is active and template exists
+  const hasActiveSubscription = subscription?.isActive && subscription.template?.isActive;
+  
+  // 8. Load publisher's live config if subscription is active and no frozen data available
+  let publisherModelPreference = null;
+  let publisherAgentOverride = null;
+  
+  if (hasActiveSubscription && !frozenExcludedModels && !frozenOverrides && subscription?.template) {
+    const publisherId = subscription.template.userId;
+    [publisherModelPreference, publisherAgentOverride] = await Promise.all([
+      prisma.modelPreference.findUnique({ where: { userId: publisherId } }),
+      prisma.agentModelOverride.findUnique({ where: { userId: publisherId } }),
+    ]);
+  }
+
+  // 9. Determine which config to use for model selection
+  let effectiveExcludedModels: string[];
+  if (frozenExcludedModels !== null) {
+    effectiveExcludedModels = frozenExcludedModels;
+  } else if (hasActiveSubscription && publisherModelPreference) {
+    effectiveExcludedModels = publisherModelPreference.excludedModels;
+  } else {
+    effectiveExcludedModels = modelPreference?.excludedModels || [];
+  }
+  
+  const subscriberOverrides = agentOverride?.overrides ? validateFullConfig(agentOverride.overrides) : undefined;
+  const publisherOverrides = publisherAgentOverride?.overrides ? validateFullConfig(publisherAgentOverride.overrides) : undefined;
+  
+  // 10. Determine base overrides (frozen, live publisher, or subscriber)
+  let baseOverrides: OhMyOpenCodeFullConfig | undefined;
+  if (frozenOverrides !== undefined) {
+    baseOverrides = frozenOverrides;
+  } else if (hasActiveSubscription && publisherOverrides) {
+    baseOverrides = publisherOverrides;
+  } else {
+    baseOverrides = subscriberOverrides;
+  }
+  
+  // 11. Merge overrides: use base (frozen/publisher), merge subscriber MCPs and plugins on top
+  let agentOverrides: OhMyOpenCodeFullConfig | undefined;
+  if (frozenOverrides !== undefined || (hasActiveSubscription && publisherOverrides)) {
+    agentOverrides = {
+      ...baseOverrides,
+      ...(subscriberOverrides?.defaultModel
+        ? { defaultModel: subscriberOverrides.defaultModel }
+        : {}),
+      mcpServers: [
+        ...(baseOverrides?.mcpServers ?? []),
+        ...(subscriberOverrides?.mcpServers ?? []),
+      ],
+      customPlugins: [
+        ...(baseOverrides?.customPlugins ?? []),
+        ...(subscriberOverrides?.customPlugins ?? []),
+      ],
+    };
+  } else {
+    agentOverrides = subscriberOverrides;
+  }
+
+   const excludedModels = new Set(effectiveExcludedModels);
+   
+   for (const provider of customProviders) {
+     if (Array.isArray(provider["excluded-models"])) {
+       for (const pattern of provider["excluded-models"]) {
+         excludedModels.add(pattern);
+       }
+     }
+   }
+
+    let resolvedSyncApiKey: string | null = null;
+    if (syncApiKey) {
+      const syncKeyRecord = await prisma.userApiKey.findUnique({
+        where: { id: syncApiKey },
+        select: { key: true },
+      });
+      if (!syncKeyRecord) {
+        throw new Error("The API key assigned to this sync token has been deleted. Please update the sync token.");
+      }
+      resolvedSyncApiKey = syncKeyRecord.key;
+    }
+
+   const [firstApiKey] = apiKeyStrings;
+   const apiKey = resolvedSyncApiKey || userApiKey?.key || (firstApiKey !== undefined ? firstApiKey : "no-api-key-create-one-in-dashboard");
+
+   const usedApiKeyId = resolvedSyncApiKey ? syncApiKey : userApiKey?.id;
+   if (usedApiKeyId) {
+     prisma.userApiKey.update({
+       where: { id: usedApiKeyId },
+       data: { lastUsedAt: new Date() },
+     }).catch(() => {});
+   }
+
+   const externalProxyUrl = getProxyUrl();
+   const internalProxyUrl = getInternalProxyUrl();
+   const [proxyModels, modelsDevLimits, dbCustomProviders] = await Promise.all([
+     apiKey !== "no-api-key-create-one-in-dashboard"
+       ? fetchProxyModelsCached(internalProxyUrl, apiKey)
+       : Promise.resolve([]),
+     fetchModelsDevLimits(),
+    prisma.customProvider.findMany({
+      where: {
+        OR: [
+          { userId },
+          { isShared: true }
+        ]
+      },
+      include: { models: true },
+      orderBy: { sortOrder: "asc" },
+    }),
+   ]);
+   const nativeModels = buildAvailableModelsFromProxy(proxyModels, modelsDevLimits);
+   const aliasModels = extractOAuthModelAliases(managementConfig as ConfigData | null, oauthAccounts, modelsDevLimits);
+   const allModels: Record<string, ModelDefinition> = {
+     ...aliasModels,
+     ...nativeModels,
+   };
+   for (const cp of dbCustomProviders) {
+     for (const m of cp.models) {
+       if (!(m.alias in allModels)) {
+         const def = inferModelDefinition(m.upstreamName, cp.providerId, modelsDevLimits);
+         allModels[m.alias] = { ...def, name: `${m.alias} (via ${cp.name})` };
+       }
+     }
+   }
+
+   const filteredModels = Object.fromEntries(
+     Object.entries(allModels).filter(([modelId]) => !excludedModels.has(modelId))
+   );
+
+    const modelEntries: Record<string, Record<string, unknown>> = {};
+   const sortedFilteredIds = Object.keys(filteredModels).sort();
+   for (const id of sortedFilteredIds) {
+     const def = filteredModels[id];
+     if (!def) continue;
+     const entry: Record<string, unknown> = {
+       name: def.name,
+       attachment: def.attachment,
+       modalities: def.modalities,
+       limit: { context: def.context, output: def.output },
+     };
+     if (def.reasoning) {
+       entry.reasoning = true;
+     }
+     modelEntries[id] = entry;
+   }
+
+    const fallbackModelId = sortedFilteredIds[0] ?? null;
+
+    const mcpEntries: McpEntry[] = agentOverrides?.mcpServers ?? [];
+    const customPlugins = agentOverrides?.customPlugins ?? [];
+    const defaultModelOverride = agentOverrides?.defaultModel?.trim();
+   
+   // Use slim plugin if user's customPlugins include it, otherwise default to normal
+   const hasSlimPlugin = customPlugins.includes("oh-my-opencode-slim@latest");
+   const omoPlugin = hasSlimPlugin ? "oh-my-opencode-slim@latest" : "oh-my-openagent@latest";
+   const defaultPlugins = ["opencode-cliproxyapi-sync@latest", omoPlugin];
+   const pluginSet = new Set([...defaultPlugins, ...customPlugins]);
+   // Ensure both variants aren't included simultaneously
+   if (hasSlimPlugin) pluginSet.delete("oh-my-openagent@latest");
+   else pluginSet.delete("oh-my-opencode-slim@latest");
+   const plugins = Array.from(pluginSet).sort();
+
+   const providers: Record<string, Record<string, unknown>> = {
+     cliproxyapi: {
+       npm: "@ai-sdk/openai-compatible",
+       name: "CLIProxyAPI",
+       options: {
+          baseURL: `${externalProxyUrl}/v1`,
+         apiKey,
+       },
+       models: modelEntries,
+     },
+   };
+
+     const opencodeConfig: Record<string, unknown> = {
+       $schema: "https://opencode.ai/config.json",
+       plugin: plugins,
+       provider: providers,
+     };
+
+    if (defaultModelOverride) {
+      opencodeConfig.model = defaultModelOverride.startsWith("cliproxyapi/")
+        ? defaultModelOverride
+        : `cliproxyapi/${defaultModelOverride}`;
+    } else if (fallbackModelId) {
+      opencodeConfig.model = `cliproxyapi/${fallbackModelId}`;
+    }
+
+    if (mcpEntries.length > 0) {
+     const mcpServers: Record<string, Record<string, unknown>> = {};
+     for (const mcp of mcpEntries) {
+       if (mcp.type === "remote") {
+         mcpServers[mcp.name] = {
+           type: "remote",
+           url: mcp.url,
+           ...(mcp.enabled !== undefined ? { enabled: mcp.enabled } : {}),
+           ...(mcp.environment && Object.keys(mcp.environment).length > 0
+             ? { environment: mcp.environment }
+             : {}),
+         };
+       } else if (mcp.type === "local") {
+         mcpServers[mcp.name] = {
+           type: "local",
+           command: mcp.command,
+           ...(mcp.enabled !== undefined ? { enabled: mcp.enabled } : {}),
+           ...(mcp.environment && Object.keys(mcp.environment).length > 0
+             ? { environment: mcp.environment }
+             : {}),
+         };
+       }
+     }
+     opencodeConfig.mcp = mcpServers;
+   }
+
+   const ohMyOpencodeConfig = buildOhMyOpenCodeConfig(
+     sortedFilteredIds,
+     agentOverrides
+   );
+
+   // Build slim config
+   const subscriberSlimOverrides = agentOverride?.slimOverrides
+     ? validateSlimConfig(agentOverride.slimOverrides)
+     : undefined;
+   const publisherSlimOverrides = publisherAgentOverride?.slimOverrides
+     ? validateSlimConfig(publisherAgentOverride.slimOverrides)
+     : undefined;
+   const slimOverrides: OhMyOpenCodeSlimFullConfig | undefined =
+     hasActiveSubscription && publisherSlimOverrides
+       ? publisherSlimOverrides
+       : subscriberSlimOverrides;
+
+   const ohMyOpenCodeSlimConfig = buildSlimConfig(sortedFilteredIds, slimOverrides);
+
+   // 11. Compute version hash
+   const bundleForHash = {
+     opencode: opencodeConfig,
+     ohMyOpencode: ohMyOpencodeConfig,
+     ohMyOpenCodeSlim: ohMyOpenCodeSlimConfig,
+   };
+   const version = crypto
+     .createHash("sha256")
+     .update(stableStringify(bundleForHash))
+     .digest("hex");
+
+  // 12. Return bundle
+  return {
+    version,
+    opencode: opencodeConfig,
+    ohMyOpencode: ohMyOpencodeConfig,
+    ohMyOpenCodeSlim: ohMyOpenCodeSlimConfig,
+  };
+}

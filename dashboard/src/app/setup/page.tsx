@@ -1,0 +1,148 @@
+"use client";
+
+import { useState } from "react";
+import { useTranslations } from "next-intl";
+import { useRouter } from "next/navigation";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { API_ENDPOINTS } from "@/lib/api-endpoints";
+import { PublicThemeToggle } from "@/components/public-theme-toggle";
+
+export default function SetupPage() {
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+  const router = useRouter();
+  const t = useTranslations("setup");
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError("");
+
+    if (password !== confirmPassword) {
+      setError(t("passwordMismatchError"));
+      return;
+    }
+
+    if (password.length < 8) {
+      setError(t("passwordTooShortError"));
+      return;
+    }
+
+    setLoading(true);
+
+    try {
+      const res = await fetch(API_ENDPOINTS.SETUP.BASE, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username, password }),
+      });
+
+      const data = await res.json();
+
+      if (!res.ok) {
+        const errorMsg = typeof data.error === "string" 
+          ? data.error 
+          : (data.error?.message ?? t('setupFailed'));
+        setError(errorMsg);
+        setLoading(false);
+        return;
+      }
+
+      // Account created successfully, redirect to dashboard
+      router.push("/dashboard");
+      router.refresh();
+    } catch {
+      setError(t("networkError"));
+      setLoading(false);
+    }
+  };
+
+  return (
+    <main id="main-content" className="flex min-h-screen items-center justify-center px-4">
+      <PublicThemeToggle />
+      <div className="w-full max-w-sm">
+        <div className="mb-6 text-center">
+          <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-xl bg-black shadow-[rgba(0,0,0,0.08)_0px_0px_0px_0.5px]">
+            <svg xmlns="http://www.w3.org/2000/svg" className="h-7 w-7 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2} aria-hidden="true">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+              <path strokeLinecap="round" strokeLinejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+            </svg>
+          </div>
+          <h1 className="text-2xl font-semibold tracking-tight text-[var(--text-primary)]">
+            {t("pageTitle")}
+          </h1>
+          <p className="mt-1 text-sm text-[var(--text-muted)]">{t("firstTimeSetup")}</p>
+        </div>
+
+         <div className="glass-card rounded-2xl p-6">
+           <div className="mb-4 rounded-xl bg-amber-500/10 border border-amber-500/20 p-3 text-sm text-amber-700">
+            {t("createAdminDescription")}
+          </div>
+
+          <form onSubmit={handleSubmit} className="space-y-4">
+            <div>
+              <label htmlFor="username" className="mb-2 block text-xs font-medium text-[var(--text-secondary)] uppercase tracking-wider">
+                {t("usernameLabel")}
+              </label>
+              <Input
+                type="text"
+                name="username"
+                value={username}
+                onChange={setUsername}
+                required
+                autoComplete="username"
+                placeholder={t("usernamePlaceholder")}
+              />
+            </div>
+
+            <div>
+              <label htmlFor="password" className="mb-2 block text-xs font-medium text-[var(--text-secondary)] uppercase tracking-wider">
+                {t("passwordLabel")}
+              </label>
+              <Input
+                type="password"
+                name="password"
+                value={password}
+                onChange={setPassword}
+                required
+                autoComplete="new-password"
+                placeholder={t("passwordPlaceholder")}
+              />
+            </div>
+
+            <div>
+              <label htmlFor="confirmPassword" className="mb-2 block text-xs font-medium text-[var(--text-secondary)] uppercase tracking-wider">
+                {t("confirmPasswordLabel")}
+              </label>
+              <Input
+                type="password"
+                name="confirmPassword"
+                value={confirmPassword}
+                onChange={setConfirmPassword}
+                required
+                autoComplete="new-password"
+              />
+            </div>
+
+            {error && (
+              <div role="alert" aria-live="polite" className="rounded-xl bg-red-500/10 border border-red-500/20 p-3 text-sm text-red-600">
+                {error}
+              </div>
+            )}
+
+            <Button type="submit" disabled={loading} className="w-full">
+              {loading ? t("creatingAccount") : t("createAccount")}
+            </Button>
+          </form>
+        </div>
+
+        <p className="mt-6 text-center text-xs text-[var(--text-muted)]">
+          {t("footerText")}
+        </p>
+      </div>
+    </main>
+  );
+}

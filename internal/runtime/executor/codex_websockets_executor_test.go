@@ -2670,12 +2670,8 @@ func TestCodexWebsockets_KeepalivePingDuringUpload_WithSession(t *testing.T) {
 		// Start server reader loop so server processes control frames.
 		readErrCh := make(chan error, 1)
 		go func() {
-			for {
-				if _, _, errRead := conn.ReadMessage(); errRead != nil {
-					readErrCh <- errRead
-					return
-				}
-			}
+			_, _, errRead := conn.ReadMessage()
+			readErrCh <- errRead
 		}()
 
 		// Wait until client has entered writeMessage and is actively holding writeMu.
@@ -2701,6 +2697,18 @@ func TestCodexWebsockets_KeepalivePingDuringUpload_WithSession(t *testing.T) {
 			return
 		}
 
+		// A Pong releases the upload hook, not the completed request. Responding
+		// before reading that request can close the socket during the client write.
+		select {
+		case errRead := <-readErrCh:
+			if errRead != nil {
+				t.Errorf("read uploaded request: %v", errRead)
+				return
+			}
+		case <-time.After(2 * time.Second):
+			t.Error("timed out reading uploaded request")
+			return
+		}
 		// Now send terminal response.
 		respPayload := []byte(`{"type":"response.completed","response":{"id":"resp-1","status":"completed","output":[]}}`)
 		_ = conn.WriteMessage(websocket.TextMessage, respPayload)
@@ -2766,12 +2774,10 @@ func TestCodexWebsockets_KeepalivePingDuringUpload_Sessionless(t *testing.T) {
 			return nil
 		})
 
+		readErrCh := make(chan error, 1)
 		go func() {
-			for {
-				if _, _, errRead := conn.ReadMessage(); errRead != nil {
-					return
-				}
-			}
+			_, _, errRead := conn.ReadMessage()
+			readErrCh <- errRead
 		}()
 
 		// Wait until client has entered writeMessage on sessionless path.
@@ -2797,6 +2803,16 @@ func TestCodexWebsockets_KeepalivePingDuringUpload_Sessionless(t *testing.T) {
 			return
 		}
 
+		select {
+		case errRead := <-readErrCh:
+			if errRead != nil {
+				t.Errorf("read uploaded request: %v", errRead)
+				return
+			}
+		case <-time.After(2 * time.Second):
+			t.Error("timed out reading uploaded request")
+			return
+		}
 		respPayload := []byte(`{"type":"response.completed","response":{"id":"resp-1","status":"completed","output":[]}}`)
 		_ = conn.WriteMessage(websocket.TextMessage, respPayload)
 	}))
@@ -2858,12 +2874,10 @@ func TestCodexWebsockets_KeepalivePingDuringUpload_NonstreamSessionless(t *testi
 			return nil
 		})
 
+		readErrCh := make(chan error, 1)
 		go func() {
-			for {
-				if _, _, errRead := conn.ReadMessage(); errRead != nil {
-					return
-				}
-			}
+			_, _, errRead := conn.ReadMessage()
+			readErrCh <- errRead
 		}()
 
 		// Wait until client has entered writeMessage on nonstream path.
@@ -2889,6 +2903,16 @@ func TestCodexWebsockets_KeepalivePingDuringUpload_NonstreamSessionless(t *testi
 			return
 		}
 
+		select {
+		case errRead := <-readErrCh:
+			if errRead != nil {
+				t.Errorf("read uploaded request: %v", errRead)
+				return
+			}
+		case <-time.After(2 * time.Second):
+			t.Error("timed out reading uploaded request")
+			return
+		}
 		respPayload := []byte(`{"type":"response.completed","response":{"id":"resp-1","status":"completed","output":[]}}`)
 		_ = conn.WriteMessage(websocket.TextMessage, respPayload)
 	}))

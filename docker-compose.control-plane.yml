@@ -1,0 +1,16 @@
+services:
+  cli-proxy-api:
+    image: cli-proxy-api-control-plane:local
+    build: .
+    environment:
+      CONTROL_PLANE_ADMIN_SECRET: ${CONTROL_PLANE_ADMIN_SECRET:?Set a separate admin secret of at least 32 bytes}
+    ports:
+      - "8317:8317"
+    volumes:
+      - ./config.yaml:/CLIProxyAPI/config.yaml
+      - control-plane-data:/data
+      - ./auths:/root/.cli-proxy-api
+    restart: unless-stopped
+
+volumes:
+  control-plane-data:

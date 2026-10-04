@@ -68,6 +68,7 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 	}
 
 	RegisterOAuthSession(state, "anthropic")
+	ctx = bindOAuthCompletionGuard(ctx, c, state, "anthropic")
 
 	isWebUI := isWebUIRequest(c)
 	var forwarder *callbackForwarder
@@ -229,6 +230,7 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 	}
 
 	RegisterOAuthSession(state, "codex")
+	ctx = bindOAuthCompletionGuard(ctx, c, state, "codex")
 
 	isWebUI := isWebUIRequest(c)
 	var forwarder *callbackForwarder

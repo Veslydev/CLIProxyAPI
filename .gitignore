@@ -31,6 +31,17 @@ auths/*
 # Documentation
 docs/*
 !docs/management-api-v8.md
+!docs/control-plane-architecture.md
+!docs/control-plane.md
+!docs/control-plane-acceptance.md
+!docs/control-plane-verification.md
+!docs/control-plane-followup-matrix.md
+!docs/control-plane-compatibility.md
+!docs/control-plane-lint.md
+web/node_modules/
+web/dist/
+web/*.tsbuildinfo
+/data/
 AGENTS.md
 CLAUDE.md
 GEMINI.md
@@ -67,3 +78,5 @@ docker-compose.override.yml
 
 # Local LLM Wiki vault
 .llm-wiki
+dashboard/node_modules/
+dashboard/dist/

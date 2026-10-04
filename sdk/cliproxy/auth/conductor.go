@@ -79,6 +79,14 @@ type Selector interface {
 	Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error)
 }
 
+// CandidatePolicy enforces host authorization before any scheduling or retry.
+// Implementations must not call Manager methods: filtering may hold its read lock.
+type CandidatePolicy interface {
+	FilterCandidates(context.Context, string, cliproxyexecutor.Options, []*Auth) ([]*Auth, error)
+}
+
+type candidatePolicyHolder struct{ policy CandidatePolicy }
+
 type PluginScheduler interface {
 	PickAuth(context.Context, pluginapi.SchedulerPickRequest) (pluginapi.SchedulerPickResponse, bool, error)
 }
@@ -150,6 +158,7 @@ type Manager struct {
 	selector                  Selector
 	hook                      Hook
 	resultPolicy              atomic.Pointer[resultPolicyHolder]
+	candidatePolicy           atomic.Pointer[candidatePolicyHolder]
 	mu                        sync.RWMutex
 	selectorMu                sync.Mutex
 	configCooldownMu          sync.Mutex

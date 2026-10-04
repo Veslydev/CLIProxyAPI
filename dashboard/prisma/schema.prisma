@@ -1,0 +1,362 @@
+// Prisma schema for CLIProxyAPI Dashboard
+// PostgreSQL database with User model for authentication
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id           String   @id @default(cuid())
+  username     String   @unique
+  passwordHash String
+  sessionVersion Int    @default(0)
+  isAdmin      Boolean  @default(false)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  modelPreference     ModelPreference?
+  agentModelOverrides AgentModelOverride?
+  syncTokens          SyncToken[]
+  apiKeys             UserApiKey[]
+  configTemplate      ConfigTemplate?
+  configSubscription  ConfigSubscription?
+  providerKeys        ProviderKeyOwnership[]
+  providerOAuth       ProviderOAuthOwnership[]
+  customProviders     CustomProvider[]
+  providerGroups      ProviderGroup[]
+  perplexityCookies   PerplexityCookie[]
+  auditLogs           AuditLog[]
+  usageRecords        UsageRecord[]
+  backupRecords       BackupRecord[]
+
+  @@map("users")
+}
+
+model ModelPreference {
+  id             String   @id @default(cuid())
+  userId         String   @unique
+  excludedModels String[]
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("model_preferences")
+}
+
+model AgentModelOverride {
+  id            String   @id @default(cuid())
+  userId        String   @unique
+  overrides     Json     @default("{}")
+  slimOverrides Json     @default("{}") @map("slim_overrides")
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("agent_model_overrides")
+}
+
+model SyncToken {
+  id         String    @id @default(cuid())
+  userId     String
+  name       String    @default("Default")
+  tokenHash  String
+  syncApiKey String?
+  lastUsedAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([tokenHash])
+  @@map("sync_tokens")
+}
+
+model UserApiKey {
+  id         String    @id @default(cuid())
+  userId     String
+  key        String    @unique
+  name       String    @default("Default")
+  lastUsedAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  usageRecords UsageRecord[]
+
+  @@index([userId])
+  @@map("user_api_keys")
+}
+
+model ConfigTemplate {
+  id        String   @id @default(cuid())
+  userId    String   @unique
+  shareCode String   @unique
+  name      String   @default("My Config")
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user          User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subscriptions ConfigSubscription[]
+
+  @@index([shareCode])
+  @@map("config_templates")
+}
+
+model ConfigSubscription {
+  id             String    @id @default(cuid())
+  userId         String    @unique
+  templateId     String
+  isActive       Boolean   @default(true)
+  frozenConfig   Json?
+  previousConfig Json?
+  subscribedAt   DateTime  @default(now())
+  lastSyncedAt   DateTime?
+
+  user     User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  template ConfigTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+
+  @@index([templateId])
+  @@map("config_subscriptions")
+}
+
+model ProviderKeyOwnership {
+  id            String   @id @default(cuid())
+  userId        String
+  provider      String
+  keyIdentifier String
+  name          String   @default("Unnamed Key")
+  keyHash       String   @unique
+  createdAt     DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([provider])
+  @@index([provider, keyHash])
+  @@map("provider_key_ownerships")
+}
+
+model ProviderOAuthOwnership {
+  id           String    @id @default(cuid())
+  userId       String
+  provider     String
+  accountName  String
+  accountEmail String?
+  createdAt    DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, accountName])
+  @@index([userId])
+  @@map("provider_oauth_ownerships")
+}
+
+model SystemSetting {
+  id    String @id @default(cuid())
+  key   String @unique
+  value String
+
+  @@map("system_settings")
+}
+
+model CustomProvider {
+  id          String   @id @default(cuid())
+  userId      String
+  groupId     String?                   // Optional: assign to a group
+  sortOrder   Int      @default(0)      // Priority order within group (or globally if ungrouped)
+  name        String                    // Display name (e.g., "OpenRouter")
+  providerId  String   @unique          // URL-safe ID (e.g., "openrouter-custom")
+  baseUrl     String                    // https://openrouter.ai/api/v1
+  apiKeyHash      String?                   // Hashed for identification (null when provider has no API key, e.g. Ollama)
+  apiKeyEncrypted String?                   // AES-256-GCM encrypted, for re-sync after proxy restart
+  prefix      String?                   // Optional routing prefix
+  proxyUrl    String?                   // Optional SOCKS5/HTTP proxy
+  headers     Json?     @default("{}")  // Custom headers JSON
+  createdAt   DateTime @default(now())
+  isShared    Boolean  @default(false) // Admin-shared providers are visible to all users
+  updatedAt   DateTime @updatedAt
+  
+  user           User                          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  group          ProviderGroup?                @relation(fields: [groupId], references: [id], onDelete: SetNull)
+  models         CustomProviderModel[]
+  excludedModels CustomProviderExcludedModel[]
+  
+  @@index([userId])
+  @@index([isShared])
+  @@index([groupId])
+  @@index([providerId])
+  @@map("custom_providers")
+}
+
+model ProviderGroup {
+  id        String   @id @default(cuid())
+  userId    String
+  name      String
+  color     String?                    // Optional hex color for UI display
+  sortOrder Int      @default(0)       // Order among groups for this user
+  isActive  Boolean  @default(true)    // Enable/disable whole group
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  providers CustomProvider[]
+
+  @@unique([userId, name])             // Unique group names per user
+  @@index([userId])
+  @@map("provider_groups")
+}
+
+model CustomProviderModel {
+  id               String @id @default(cuid())
+  customProviderId String
+  upstreamName     String // e.g., "moonshotai/kimi-k2:free"
+  alias            String // e.g., "kimi-k2"
+  
+  customProvider CustomProvider @relation(fields: [customProviderId], references: [id], onDelete: Cascade)
+  
+  @@index([customProviderId])
+  @@map("custom_provider_models")
+}
+
+model CustomProviderExcludedModel {
+  id               String @id @default(cuid())
+  customProviderId String
+  pattern          String // e.g., "gpt-4", "claude-*"
+  
+  customProvider CustomProvider @relation(fields: [customProviderId], references: [id], onDelete: Cascade)
+  
+  @@index([customProviderId])
+  @@map("custom_provider_excluded_models")
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  userId    String   // Who performed the action
+  action    String   // e.g., "USER_CREATED", "API_KEY_REVOKED"
+  target    String?  // What was affected (e.g., username, keyId)
+  metadata  Json?    // Additional context
+  ipAddress String?  // Source IP
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([createdAt])
+  @@index([action])
+  @@index([target])
+  @@map("audit_logs")
+}
+
+model UsageRecord {
+  id              String   @id @default(cuid())
+  authIndex       String
+  apiKeyId        String?
+  userId          String?
+  model           String
+  source          String
+  timestamp       DateTime
+  latencyMs       Int      @default(0)
+  inputTokens     Int      @default(0)
+  outputTokens    Int      @default(0)
+  reasoningTokens Int      @default(0)
+  cachedTokens    Int      @default(0)
+  totalTokens     Int      @default(0)
+  failed          Boolean  @default(false)
+  collectedAt     DateTime @default(now())
+
+  user   User?       @relation(fields: [userId], references: [id], onDelete: SetNull)
+  apiKey UserApiKey? @relation(fields: [apiKeyId], references: [id], onDelete: SetNull)
+
+  @@unique([authIndex, model, timestamp, source, totalTokens], name: "usage_dedup_key")
+  @@index([userId])
+  @@index([authIndex])
+  @@index([timestamp])
+  @@index([model])
+  @@index([source])
+  @@index([userId, timestamp])
+  @@index([authIndex, timestamp])
+  @@index([collectedAt])
+  @@map("usage_records")
+}
+
+model PerplexityCookie {
+  id         String   @id @default(cuid())
+  userId     String
+  cookieData String
+  label      String   @default("Default")
+  isActive   Boolean  @default(true)
+  lastUsedAt DateTime?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([isActive])
+  @@map("perplexity_cookies")
+}
+
+model CollectorState {
+  id              String   @id @default(cuid())
+  lastCollectedAt DateTime @default(now())
+  lastStatus      String   @default("idle")
+  recordsStored   Int      @default(0)
+  errorMessage    String?
+  updatedAt       DateTime @updatedAt
+
+  @@map("collector_state")
+}
+
+// ============================================================================
+// Backup & Restore System
+// ============================================================================
+
+model BackupRecord {
+  id          String       @id @default(cuid())
+  filename    String
+  sizeBytes   BigInt
+  status      BackupStatus @default(PENDING)
+  type        BackupType   @default(MANUAL)
+  createdAt   DateTime     @default(now())
+  completedAt DateTime?
+  createdById String
+  createdBy   User         @relation(fields: [createdById], references: [id], onDelete: Cascade)
+  checksum    String?      // SHA-256 for integrity verification
+  metadata    Json?        // Additional info: DB version, model counts, dashboard version
+
+  @@index([createdAt])
+  @@index([createdById])
+  @@map("backup_records")
+}
+
+model BackupSchedule {
+  id        String    @id @default(cuid())
+  enabled   Boolean   @default(false)
+  cronExpr  String    @default("0 3 * * *") // Default: 3 AM daily
+  retention Int       @default(7)           // Days to keep backups
+  lastRun   DateTime?
+  nextRun   DateTime?
+  updatedAt DateTime  @updatedAt
+
+  @@map("backup_schedule")
+}
+
+enum BackupStatus {
+  PENDING
+  IN_PROGRESS
+  COMPLETED
+  FAILED
+  RESTORING
+}
+
+enum BackupType {
+  MANUAL
+  SCHEDULED
+}

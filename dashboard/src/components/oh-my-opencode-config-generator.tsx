@@ -1,0 +1,774 @@
+"use client";
+
+import { useTranslations } from "next-intl";
+
+import Link from "next/link";
+import { useCallback, useEffect, useRef, useState } from "react";
+
+import { CopyBlock } from "@/components/copy-block";
+import { downloadFile } from "@/components/oh-my-opencode/model-badge";
+import type { ModelBadgeFieldValue } from "@/components/oh-my-opencode/model-badge";
+import { TierAssignments } from "@/components/oh-my-opencode/tier-assignments";
+import { ToggleSections } from "@/components/oh-my-opencode/toggle-sections";
+import { Button } from "@/components/ui/button";
+import { useToast } from "@/components/ui/toast";
+import { API_ENDPOINTS } from "@/lib/api-endpoints";
+import {
+  AGENT_ROLE_LABELS as AGENT_ROLES,
+  CATEGORY_ROLE_LABELS as CATEGORY_ROLES,
+  UPSTREAM_AGENT_CHAINS,
+  UPSTREAM_CATEGORY_CHAINS,
+  resolveChain,
+  buildOhMyOpenCodeConfig,
+  applyPreset,
+  getMissingPresetModels,
+  type ConfigData,
+  type OAuthAccount,
+} from "@/lib/config-generators/oh-my-opencode";
+import type {
+  AgentConfigEntry,
+  BackgroundTaskConfig,
+  BrowserAutomationConfig,
+  CategoryConfigEntry,
+  GitMasterConfig,
+  OhMyOpenCodeFullConfig,
+  OhMyOpenCodePreset,
+  SisyphusAgentConfig,
+  TmuxConfig,
+} from "@/lib/config-generators/oh-my-opencode-types";
+
+interface OhMyOpenCodeConfigGeneratorProps {
+  apiKeys: { key: string; name: string | null }[];
+  config: ConfigData | null;
+  oauthAccounts: OAuthAccount[];
+  proxyModelIds?: string[];
+  excludedModels?: string[];
+  agentOverrides?: OhMyOpenCodeFullConfig;
+  modelSourceMap?: Map<string, string>;
+}
+
+export function OhMyOpenCodeConfigGenerator(props: OhMyOpenCodeConfigGeneratorProps) {
+  const { apiKeys, proxyModelIds, excludedModels, agentOverrides: initialOverrides, modelSourceMap } = props;
+  const [isExpanded, setIsExpanded] = useState(false);
+  const [overrides, setOverrides] = useState<OhMyOpenCodeFullConfig>(initialOverrides ?? { agents: {}, categories: {} });
+  const [saving, setSaving] = useState(false);
+  const nextIdRef = useRef(0);
+  const nextId = useCallback(() => `row-${nextIdRef.current++}`, []);
+  const [providerConcurrencyRows, setProviderConcurrencyRows] = useState<Array<{ _id: string; key: string; value: number }>>([]);
+  const [modelConcurrencyRows, setModelConcurrencyRows] = useState<Array<{ _id: string; key: string; value: number }>>([]);
+  const [presets, setPresets] = useState<OhMyOpenCodePreset[]>([]);
+  const [presetsLoading, setPresetsLoading] = useState(true);
+  const tmuxDebounceRef = useRef<NodeJS.Timeout | null>(null);
+  const { showToast } = useToast();
+  const t = useTranslations("ohMyOpenCode");
+
+  const allModelIds = proxyModelIds ?? [];
+  const availableModelIds = excludedModels
+    ? allModelIds.filter((id: string) => !excludedModels.includes(id))
+    : allModelIds;
+  const hasModels = availableModelIds.length > 0;
+
+  const ohMyConfig = hasModels ? buildOhMyOpenCodeConfig(availableModelIds, overrides) : null;
+  const configJson = ohMyConfig ? JSON.stringify(ohMyConfig, null, 2) : "";
+
+  useEffect(() => {
+    if (initialOverrides?.background_task?.providerConcurrency) {
+      const entries = Object.entries(initialOverrides.background_task.providerConcurrency);
+      setProviderConcurrencyRows(entries.map(([key, value]) => ({ _id: nextId(), key, value })));
+    }
+    if (initialOverrides?.background_task?.modelConcurrency) {
+      const entries = Object.entries(initialOverrides.background_task.modelConcurrency);
+      setModelConcurrencyRows(entries.map(([key, value]) => ({ _id: nextId(), key, value })));
+    }
+  }, [initialOverrides, nextId]);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    async function loadPresets() {
+      try {
+        setPresetsLoading(true);
+        const response = await fetch(API_ENDPOINTS.OH_MY_OPENCODE_PRESETS);
+        if (!response.ok) {
+          throw new Error("Failed to load presets");
+        }
+
+        const data = await response.json() as { presets?: OhMyOpenCodePreset[] };
+        if (isMounted) {
+          setPresets(Array.isArray(data.presets) ? data.presets : []);
+        }
+      } catch {
+        if (isMounted) {
+          setPresets([]);
+          showToast(t("toastPresetLoadFailed"), "error");
+        }
+      } finally {
+        if (isMounted) {
+          setPresetsLoading(false);
+        }
+      }
+    }
+
+    void loadPresets();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [showToast, t]);
+
+  const latestSaveRef = useRef<OhMyOpenCodeFullConfig>(overrides);
+
+  const saveOverrides = useCallback(
+    async (newOverrides: OhMyOpenCodeFullConfig) => {
+      const previous = latestSaveRef.current;
+      latestSaveRef.current = newOverrides;
+      setSaving(true);
+      try {
+        const res = await fetch(API_ENDPOINTS.AGENT_CONFIG, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ overrides: newOverrides }),
+        });
+        if (!res.ok) {
+          if (latestSaveRef.current === newOverrides) {
+            latestSaveRef.current = previous;
+            setOverrides(previous);
+          }
+          showToast(t("toastSaveFailed"), "error");
+          return;
+        }
+        showToast(t("toastSaved"), "success");
+      } catch {
+        if (latestSaveRef.current === newOverrides) {
+          latestSaveRef.current = previous;
+          setOverrides(previous);
+        }
+        showToast(t("toastNetworkError"), "error");
+      } finally {
+        setSaving(false);
+      }
+    },
+    [showToast, t],
+  );
+
+  const handleAgentModelChange = (agent: string, model: string | undefined) => {
+    const existing = overrides.agents?.[agent] ?? {};
+    const newAgents = { ...overrides.agents };
+    if (model === undefined) {
+      const rest = { ...existing };
+      delete rest.model;
+      if (Object.keys(rest).length === 0) {
+        delete newAgents[agent];
+      } else {
+        newAgents[agent] = rest;
+      }
+    } else {
+      newAgents[agent] = { ...existing, model };
+    }
+    const newOverrides = { ...overrides, agents: newAgents };
+    setOverrides(newOverrides);
+    saveOverrides(newOverrides);
+  };
+
+  const handleAgentFieldChange = (agent: string, field: string, value: ModelBadgeFieldValue) => {
+    const existing = overrides.agents?.[agent] ?? {};
+    const newAgents = { ...overrides.agents };
+    const isEmptyObject =
+      typeof value === "object" &&
+      value !== null &&
+      !Array.isArray(value) &&
+      Object.values(value).every((entry) => entry === undefined || entry === "");
+
+    if (value === undefined || value === "" || (Array.isArray(value) && value.length === 0) || isEmptyObject) {
+      const updated = { ...existing } as Record<string, unknown>;
+      delete updated[field];
+      if (Object.keys(updated).length === 0) {
+        delete newAgents[agent];
+      } else {
+        newAgents[agent] = updated as AgentConfigEntry;
+      }
+    } else {
+      newAgents[agent] = { ...existing, [field]: value } as AgentConfigEntry;
+    }
+    const newOverrides = { ...overrides, agents: newAgents };
+    setOverrides(newOverrides);
+    saveOverrides(newOverrides);
+  };
+
+  const handleCategoryModelChange = (category: string, model: string | undefined) => {
+    const existing = overrides.categories?.[category] ?? {};
+    const newCategories = { ...overrides.categories };
+    if (model === undefined) {
+      const rest = { ...existing };
+      delete rest.model;
+      if (Object.keys(rest).length === 0) {
+        delete newCategories[category];
+      } else {
+        newCategories[category] = rest;
+      }
+    } else {
+      newCategories[category] = { ...existing, model };
+    }
+    const newOverrides = { ...overrides, categories: newCategories };
+    setOverrides(newOverrides);
+    saveOverrides(newOverrides);
+  };
+
+  const handleCategoryFieldChange = (category: string, field: string, value: string | number | string[] | undefined) => {
+    const existing = overrides.categories?.[category] ?? {};
+    const newCategories = { ...overrides.categories };
+    if (value === undefined || value === "" || (Array.isArray(value) && value.length === 0)) {
+      const updated = { ...existing } as Record<string, unknown>;
+      delete updated[field];
+      if (Object.keys(updated).length === 0) {
+        delete newCategories[category];
+      } else {
+        newCategories[category] = updated as CategoryConfigEntry;
+      }
+    } else {
+      newCategories[category] = { ...existing, [field]: value } as CategoryConfigEntry;
+    }
+    const newOverrides = { ...overrides, categories: newCategories };
+    setOverrides(newOverrides);
+    saveOverrides(newOverrides);
+  };
+
+  const handleDisabledAgentToggle = (agent: string) => {
+    const current = overrides.disabled_agents ?? [];
+    const newDisabled = current.includes(agent) ? current.filter((a) => a !== agent) : [...current, agent];
+    const newOverrides = { ...overrides, disabled_agents: newDisabled.length > 0 ? newDisabled : undefined };
+    setOverrides(newOverrides);
+    saveOverrides(newOverrides);
+  };
+
+  const handleDisabledSkillToggle = (skill: string) => {
+    const current = overrides.disabled_skills ?? [];
+    const newDisabled = current.includes(skill) ? current.filter((s) => s !== skill) : [...current, skill];
+    const newOverrides = { ...overrides, disabled_skills: newDisabled.length > 0 ? newDisabled : undefined };
+    setOverrides(newOverrides);
+    saveOverrides(newOverrides);
+  };
+
+  const handleDisabledCommandToggle = (command: string) => {
+    const current = overrides.disabled_commands ?? [];
+    const newDisabled = current.includes(command)
+      ? current.filter((c) => c !== command)
+      : [...current, command];
+    const newOverrides = { ...overrides, disabled_commands: newDisabled.length > 0 ? newDisabled : undefined };
+    setOverrides(newOverrides);
+    saveOverrides(newOverrides);
+  };
+
+  const handleDisabledHookToggle = (hook: string) => {
+    const current = overrides.disabled_hooks ?? [];
+    const newDisabled = current.includes(hook) ? current.filter((h) => h !== hook) : [...current, hook];
+    const newOverrides = { ...overrides, disabled_hooks: newDisabled.length > 0 ? newDisabled : undefined };
+    setOverrides(newOverrides);
+    saveOverrides(newOverrides);
+  };
+
+  const handleTmuxEnabledToggle = () => {
+    const currentTmux = overrides.tmux ?? {};
+    const newEnabled = !currentTmux.enabled;
+    const newTmux = newEnabled
+      ? {
+          enabled: true,
+          layout: currentTmux.layout ?? "main-vertical",
+          main_pane_size: currentTmux.main_pane_size ?? 60,
+          main_pane_min_width: currentTmux.main_pane_min_width ?? 120,
+          agent_pane_min_width: currentTmux.agent_pane_min_width ?? 40,
+        }
+      : undefined;
+    const newOverrides = { ...overrides, tmux: newTmux };
+    setOverrides(newOverrides);
+    saveOverrides(newOverrides);
+  };
+
+  const handleTmuxLayoutChange = (layout: string) => {
+    const currentTmux = overrides.tmux ?? { enabled: true };
+    const newTmux = { ...currentTmux, layout };
+    const newOverrides = { ...overrides, tmux: newTmux };
+    setOverrides(newOverrides);
+    saveOverrides(newOverrides);
+  };
+
+  const TMUX_FIELD_RANGES: Partial<Record<keyof TmuxConfig, { min: number; max?: number }>> = {
+    main_pane_size: { min: 20, max: 80 },
+    main_pane_min_width: { min: 0 },
+    agent_pane_min_width: { min: 0 },
+  };
+
+  const handleTmuxNumberChange = (field: keyof TmuxConfig, value: number) => {
+    if (tmuxDebounceRef.current) clearTimeout(tmuxDebounceRef.current);
+    tmuxDebounceRef.current = setTimeout(() => {
+      const range = TMUX_FIELD_RANGES[field];
+      let clamped = value;
+      if (range) {
+        clamped = Math.max(range.min, clamped);
+        if (range.max !== undefined) clamped = Math.min(range.max, clamped);
+      }
+      const currentTmux = overrides.tmux ?? { enabled: true };
+      const newTmux = { ...currentTmux, [field]: clamped };
+      const newOverrides = { ...overrides, tmux: newTmux };
+      setOverrides(newOverrides);
+      saveOverrides(newOverrides);
+    }, 500);
+  };
+
+  const handleBgTaskNumberChange = (field: keyof BackgroundTaskConfig, value: number) => {
+    const currentBg = overrides.background_task ?? {};
+    const newBg = { ...currentBg, [field]: value };
+    const newOverrides = { ...overrides, background_task: newBg };
+    setOverrides(newOverrides);
+    saveOverrides(newOverrides);
+  };
+
+  const handleProviderConcurrencyChange = (
+    index: number,
+    field: "key" | "value",
+    newValue: string | number,
+  ) => {
+    const newRows = [...providerConcurrencyRows];
+    const row = newRows[index];
+    if (!row) return;
+    if (field === "key") {
+      row.key = newValue as string;
+    } else {
+      row.value = newValue as number;
+    }
+    setProviderConcurrencyRows(newRows);
+    const providerConcurrency = Object.fromEntries(newRows.map((row) => [row.key, row.value]));
+    const newBg = { ...overrides.background_task, providerConcurrency };
+    const newOverrides = { ...overrides, background_task: newBg };
+    setOverrides(newOverrides);
+    saveOverrides(newOverrides);
+  };
+
+  const handleProviderConcurrencyAdd = () => {
+    setProviderConcurrencyRows([...providerConcurrencyRows, { _id: nextId(), key: "", value: 1 }]);
+  };
+
+  const handleProviderConcurrencyRemove = (index: number) => {
+    const newRows = providerConcurrencyRows.filter((_, i) => i !== index);
+    setProviderConcurrencyRows(newRows);
+    const providerConcurrency = Object.fromEntries(newRows.map((row) => [row.key, row.value]));
+    const newBg = { ...overrides.background_task, providerConcurrency };
+    const newOverrides = { ...overrides, background_task: newBg };
+    setOverrides(newOverrides);
+    saveOverrides(newOverrides);
+  };
+
+  const handleModelConcurrencyChange = (index: number, field: "key" | "value", newValue: string | number) => {
+    const newRows = [...modelConcurrencyRows];
+    const row = newRows[index];
+    if (!row) return;
+    if (field === "key") {
+      row.key = newValue as string;
+    } else {
+      row.value = newValue as number;
+    }
+    setModelConcurrencyRows(newRows);
+    const modelConcurrency = Object.fromEntries(newRows.map((row) => [row.key, row.value]));
+    const newBg = { ...overrides.background_task, modelConcurrency };
+    const newOverrides = { ...overrides, background_task: newBg };
+    setOverrides(newOverrides);
+    saveOverrides(newOverrides);
+  };
+
+  const handleModelConcurrencyAdd = () => {
+    setModelConcurrencyRows([...modelConcurrencyRows, { _id: nextId(), key: "", value: 1 }]);
+  };
+
+  const handleModelConcurrencyRemove = (index: number) => {
+    const newRows = modelConcurrencyRows.filter((_, i) => i !== index);
+    setModelConcurrencyRows(newRows);
+    const modelConcurrency = Object.fromEntries(newRows.map((row) => [row.key, row.value]));
+    const newBg = { ...overrides.background_task, modelConcurrency };
+    const newOverrides = { ...overrides, background_task: newBg };
+    setOverrides(newOverrides);
+    saveOverrides(newOverrides);
+  };
+
+  const handleSisyphusToggle = (field: keyof SisyphusAgentConfig) => {
+    const currentSisyphus = overrides.sisyphus_agent ?? {};
+    const newSisyphus = { ...currentSisyphus, [field]: !currentSisyphus[field] };
+    const newOverrides = { ...overrides, sisyphus_agent: newSisyphus };
+    setOverrides(newOverrides);
+    saveOverrides(newOverrides);
+  };
+
+  const handleGitMasterToggle = (field: keyof GitMasterConfig) => {
+    const currentGit = overrides.git_master ?? {};
+    const newGit = { ...currentGit, [field]: !currentGit[field] };
+    const newOverrides = { ...overrides, git_master: newGit };
+    setOverrides(newOverrides);
+    saveOverrides(newOverrides);
+  };
+
+  const handleHashlineEditToggle = () => {
+    const newOverrides = { ...overrides, hashline_edit: !(overrides.hashline_edit ?? false) };
+    setOverrides(newOverrides);
+    saveOverrides(newOverrides);
+  };
+
+  const handleExperimentalToggle = (field: keyof NonNullable<OhMyOpenCodeFullConfig["experimental"]>) => {
+    const currentExperimental = overrides.experimental ?? {};
+    const newExperimental = { ...currentExperimental, [field]: !currentExperimental[field] };
+    const newOverrides = { ...overrides, experimental: newExperimental };
+    setOverrides(newOverrides);
+    saveOverrides(newOverrides);
+  };
+
+  const handleBrowserProviderChange = (provider: string) => {
+    const newBrowser: BrowserAutomationConfig = { provider };
+    const newOverrides = { ...overrides, browser_automation_engine: newBrowser };
+    setOverrides(newOverrides);
+    saveOverrides(newOverrides);
+  };
+
+  const handleMcpAdd = (mcp: string) => {
+    const trimmed = mcp.trim();
+    if (!trimmed) return false;
+    const current = overrides.disabled_mcps ?? [];
+    if (current.includes(trimmed)) {
+      return true;
+    }
+    const newDisabled = [...current, trimmed];
+    const newOverrides = { ...overrides, disabled_mcps: newDisabled };
+    setOverrides(newOverrides);
+    saveOverrides(newOverrides);
+    return true;
+  };
+
+  const handleMcpRemove = (mcp: string) => {
+    const current = overrides.disabled_mcps ?? [];
+    const newDisabled = current.filter((item) => item !== mcp);
+    const newOverrides = { ...overrides, disabled_mcps: newDisabled.length > 0 ? newDisabled : undefined };
+    setOverrides(newOverrides);
+    saveOverrides(newOverrides);
+  };
+
+  const handleLspAdd = (language: string, command: string, extensions: string) => {
+    const trimmedLanguage = language.trim();
+    const trimmedCommand = command.trim();
+    if (!trimmedLanguage || !trimmedCommand) return false;
+    const currentLsp = overrides.lsp ?? {};
+    if (currentLsp[trimmedLanguage]) {
+      return true;
+    }
+    const commandArray = trimmedCommand.split(/\s+/);
+    const extensionsArray = extensions
+      .split(",")
+      .map((ext) => ext.trim())
+      .filter((ext) => ext.length > 0);
+    const newLsp = {
+      ...currentLsp,
+      [trimmedLanguage]: {
+        command: commandArray,
+        ...(extensionsArray.length > 0 ? { extensions: extensionsArray } : {}),
+      },
+    };
+    const newOverrides = { ...overrides, lsp: newLsp };
+    setOverrides(newOverrides);
+    saveOverrides(newOverrides);
+    return true;
+  };
+
+  const handleLspRemove = (language: string) => {
+    const currentLsp = overrides.lsp ?? {};
+    const newLsp = { ...currentLsp };
+    delete newLsp[language];
+    const newOverrides = { ...overrides, lsp: Object.keys(newLsp).length > 0 ? newLsp : undefined };
+    setOverrides(newOverrides);
+    saveOverrides(newOverrides);
+  };
+
+  if (apiKeys.length === 0) {
+    return (
+      <div className="space-y-3">
+        <div className="border-l-4 border-amber-300 bg-amber-500/10 p-4 rounded-r-xl">
+          <div className="text-sm font-medium text-[var(--text-primary)] mb-1">{t("apiKeyRequiredTitle")}</div>
+          <p className="text-sm text-[var(--text-secondary)]">{t("apiKeyRequiredDesc")}</p>
+          <Link
+            href="/dashboard/api-keys"
+            className="mt-3 inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-[var(--surface-muted)] border border-[var(--surface-border)] text-[var(--text-primary)] text-sm font-medium hover:bg-[var(--surface-hover)] transition-colors"
+          >
+            {t("createApiKeyLink")}
+          </Link>
+        </div>
+      </div>
+    );
+  }
+
+  if (!hasModels || !ohMyConfig) {
+    return (
+      <div className="space-y-4">
+        <div className="border-l-4 border-amber-300 bg-amber-500/10 p-4 text-sm rounded-r-xl">
+          <p className="text-[var(--text-primary)] font-medium mb-1">{t("noProvidersTitle")}</p>
+          <p className="text-[var(--text-muted)] text-xs">
+            {t("noProvidersDesc")}{" "}
+            <Link
+              href="/dashboard/providers"
+              className="text-[var(--text-secondary)] font-medium hover:text-[var(--text-primary)] underline underline-offset-2 decoration-[var(--surface-border)]"
+            >
+              {t("noProvidersLink")}
+            </Link>{" "}
+            {t("noProvidersDescSuffix")}
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  const agentAssignments: {
+    name: string;
+    model: string;
+    isOverride: boolean;
+    isUnresolved?: boolean;
+    config: AgentConfigEntry;
+    tier: 1 | 2 | 3 | 4;
+    label: string;
+  }[] = [];
+
+  for (const [agent, chain] of Object.entries(UPSTREAM_AGENT_CHAINS)) {
+    const agentConfig = overrides?.agents?.[agent] ?? {};
+    const overrideModel = agentConfig.model;
+    if (overrideModel && availableModelIds.includes(overrideModel)) {
+      const overrideChainIdx = chain.indexOf(overrideModel);
+      const overrideTier = overrideChainIdx <= 1 ? 1 as const : overrideChainIdx <= 3 ? 2 as const : 3 as const;
+      agentAssignments.push({
+        name: agent,
+        model: overrideModel,
+        isOverride: true,
+        isUnresolved: false,
+        config: agentConfig,
+        tier: overrideTier,
+        label: AGENT_ROLES[agent] ?? agent,
+      });
+    } else {
+      const resolution = resolveChain(chain, availableModelIds);
+      if (resolution) {
+        const chainIdx = chain.indexOf(resolution.model);
+        const tier = chainIdx <= 1 ? 1 as const : chainIdx <= 3 ? 2 as const : 3 as const;
+        agentAssignments.push({
+          name: agent,
+          model: resolution.model,
+          isOverride: false,
+          isUnresolved: false,
+          config: agentConfig,
+          tier,
+          label: AGENT_ROLES[agent] ?? agent,
+        });
+      } else {
+        const model = overrideModel ?? chain[0];
+        if (model === undefined) {
+          continue;
+        }
+        agentAssignments.push({
+          name: agent,
+          model,
+          isOverride: !!overrideModel,
+          isUnresolved: true,
+          config: agentConfig,
+          tier: 1 as const,
+          label: AGENT_ROLES[agent] ?? agent,
+        });
+      }
+    }
+  }
+  agentAssignments.sort((a, b) => a.tier - b.tier || a.name.localeCompare(b.name));
+
+  const categoryAssignments: {
+    name: string;
+    model: string;
+    isOverride: boolean;
+    isUnresolved?: boolean;
+    config: CategoryConfigEntry;
+    tier: 1 | 2 | 3 | 4;
+    label: string;
+  }[] = [];
+
+  for (const [category, chain] of Object.entries(UPSTREAM_CATEGORY_CHAINS)) {
+    const categoryConfig = overrides?.categories?.[category] ?? {};
+    const overrideModel = categoryConfig.model;
+    if (overrideModel && availableModelIds.includes(overrideModel)) {
+      const overrideChainIdx = chain.indexOf(overrideModel);
+      const overrideTier = overrideChainIdx <= 1 ? 1 as const : overrideChainIdx <= 3 ? 2 as const : 3 as const;
+      categoryAssignments.push({
+        name: category,
+        model: overrideModel,
+        isOverride: true,
+        isUnresolved: false,
+        config: categoryConfig,
+        tier: overrideTier,
+        label: CATEGORY_ROLES[category] ?? category,
+      });
+    } else {
+      const resolution = resolveChain(chain, availableModelIds);
+      if (resolution) {
+        const chainIdx = chain.indexOf(resolution.model);
+        const tier = chainIdx <= 1 ? 1 as const : chainIdx <= 3 ? 2 as const : 3 as const;
+        categoryAssignments.push({
+          name: category,
+          model: resolution.model,
+          isOverride: false,
+          isUnresolved: false,
+          config: categoryConfig,
+          tier,
+          label: CATEGORY_ROLES[category] ?? category,
+        });
+      } else {
+        const model = overrideModel ?? chain[0];
+        if (model === undefined) {
+          continue;
+        }
+        categoryAssignments.push({
+          name: category,
+          model,
+          isOverride: !!overrideModel,
+          isUnresolved: true,
+          config: categoryConfig,
+          tier: 1 as const,
+          label: CATEGORY_ROLES[category] ?? category,
+        });
+      }
+    }
+  }
+  categoryAssignments.sort((a, b) => a.tier - b.tier || a.name.localeCompare(b.name));
+
+  const handleDownload = () => {
+    if (configJson) {
+      downloadFile(configJson, "oh-my-openagent.json");
+    }
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between gap-4 flex-wrap">
+        <p className="text-sm text-[var(--text-secondary)]">
+          {t("assignmentsDesc")}
+          {saving && <span className="ml-2 text-amber-700/70 text-xs">{t("saving")}</span>}
+        </p>
+        <div className="flex items-center gap-2">
+          <span className="text-sm text-[var(--text-muted)]">{t("presetLabel")}</span>
+          <select
+            className="px-3 py-1.5 rounded-lg bg-[var(--surface-muted)] border border-[var(--surface-border)] text-sm text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)]/20"
+            disabled={presetsLoading || presets.length === 0}
+            onChange={(e) => {
+              const presetName = e.target.value;
+              if (!presetName) return;
+              const preset = presets.find((p) => p.name === presetName);
+              if (preset) {
+                const newOverrides = applyPreset(preset, overrides);
+                setOverrides(newOverrides);
+                saveOverrides(newOverrides);
+                const missing = getMissingPresetModels(preset, availableModelIds);
+                if (missing.length > 0) {
+                  const modelList = missing.map(m => m.model).join(", ");
+                  showToast(t("toastPresetApplied", { models: modelList }), "info");
+                }
+              }
+            }}
+            value=""
+          >
+            <option value="">{presetsLoading ? t("loadingPresets") : t("applyPreset")}</option>
+            {presets.map((preset) => (
+              <option key={preset.name} value={preset.name}>
+                {preset.name}
+              </option>
+            ))}
+          </select>
+        </div>
+      </div>
+
+      <TierAssignments
+        agentAssignments={agentAssignments}
+        categoryAssignments={categoryAssignments}
+        availableModelIds={availableModelIds}
+        modelSourceMap={modelSourceMap}
+        onAgentModelChange={handleAgentModelChange}
+        onAgentFieldChange={handleAgentFieldChange}
+        onCategoryModelChange={handleCategoryModelChange}
+        onCategoryFieldChange={handleCategoryFieldChange}
+      />
+
+      <ToggleSections
+        overrides={overrides}
+        providerConcurrencyRows={providerConcurrencyRows}
+        modelConcurrencyRows={modelConcurrencyRows}
+        onDisabledAgentToggle={handleDisabledAgentToggle}
+        onDisabledSkillToggle={handleDisabledSkillToggle}
+        onDisabledCommandToggle={handleDisabledCommandToggle}
+        onDisabledHookToggle={handleDisabledHookToggle}
+        onTmuxEnabledToggle={handleTmuxEnabledToggle}
+        onTmuxLayoutChange={handleTmuxLayoutChange}
+        onTmuxNumberChange={handleTmuxNumberChange}
+        onBgTaskNumberChange={handleBgTaskNumberChange}
+        onProviderConcurrencyChange={handleProviderConcurrencyChange}
+        onProviderConcurrencyAdd={handleProviderConcurrencyAdd}
+        onProviderConcurrencyRemove={handleProviderConcurrencyRemove}
+        onModelConcurrencyChange={handleModelConcurrencyChange}
+        onModelConcurrencyAdd={handleModelConcurrencyAdd}
+        onModelConcurrencyRemove={handleModelConcurrencyRemove}
+        onSisyphusToggle={handleSisyphusToggle}
+        onGitMasterToggle={handleGitMasterToggle}
+        onHashlineEditToggle={handleHashlineEditToggle}
+        onExperimentalToggle={handleExperimentalToggle}
+        onBrowserProviderChange={handleBrowserProviderChange}
+        onMcpAdd={handleMcpAdd}
+        onMcpRemove={handleMcpRemove}
+        onLspAdd={handleLspAdd}
+        onLspRemove={handleLspRemove}
+      />
+
+      <button
+        type="button"
+        onClick={() => setIsExpanded(!isExpanded)}
+        className="flex items-center gap-2 text-xs font-medium text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors"
+      >
+        <svg
+          width="12"
+          height="12"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          className={`transition-transform duration-200 ${isExpanded ? "rotate-90" : ""}`}
+          aria-hidden="true"
+        >
+          <polyline points="9 18 15 12 9 6" />
+        </svg>
+        {isExpanded ? t("hideConfig") : t("showConfig")}
+      </button>
+
+      {isExpanded && (
+        <div className="space-y-4">
+          <CopyBlock code={configJson} />
+
+          <div className="flex gap-3">
+            <Button onClick={handleDownload} variant="secondary" className="flex items-center gap-2">
+              <svg
+                width="16"
+                height="16"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                aria-hidden="true"
+              >
+                <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" />
+                <polyline points="7 10 12 15 17 10" />
+                <line x1="12" y1="15" x2="12" y2="3" />
+              </svg>
+              {t("downloadButton")}
+            </Button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

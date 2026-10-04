@@ -18,6 +18,9 @@ const RequestPathMetadataKey = "request_path"
 // DisallowFreeAuthMetadataKey instructs auth selection to skip known free-tier credentials.
 const DisallowFreeAuthMetadataKey = "disallow_free_auth"
 
+// CandidateProvidersMetadataKey preserves the provider set before health filtering.
+const CandidateProvidersMetadataKey = "candidate_providers"
+
 // AuthSelectionModelMetadataKey overrides the model used only for auth selection.
 const AuthSelectionModelMetadataKey = "auth_selection_model"
 

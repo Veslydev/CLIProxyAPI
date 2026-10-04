@@ -1,0 +1,295 @@
+"use client";
+import { dashboardFetch as fetch } from "@native/api";
+
+import { useTranslations } from 'next-intl';
+import { useState, useEffect, useRef } from "react";
+import { Button } from "@/components/ui/button";
+import { useToast } from "@/components/ui/toast";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { API_ENDPOINTS } from "@/lib/api-endpoints";
+
+const LOGS_PER_PAGE = 50;
+
+const LOG_LEVEL = {
+  INFO: "info",
+  WARN: "warn",
+  ERROR: "error",
+  UNKNOWN: "unknown",
+} as const;
+
+type LogLevel = (typeof LOG_LEVEL)[keyof typeof LOG_LEVEL];
+
+interface LogsResponse {
+  disabled?: boolean;
+  lines: string[];
+  "line-count": number;
+  "latest-timestamp": number;
+}
+
+interface FetchLogsParams {
+  setDisabled?: (value: boolean) => void;
+  setLogs: (logs: string[]) => void;
+  setLatestTimestamp: (timestamp: number | null) => void;
+  setLoading: (loading: boolean) => void;
+  showToast: (message: string, type: "success" | "error" | "info") => void;
+  messages: { loadFailed: string; networkError: string };
+  after?: number | null;
+  append?: boolean;
+  currentLogs?: string[];
+  signal?: AbortSignal;
+}
+
+async function fetchLogs({
+  setDisabled,
+  setLogs,
+  setLatestTimestamp,
+  setLoading,
+  showToast,
+  messages,
+  after,
+  append,
+  currentLogs,
+  signal,
+}: FetchLogsParams) {
+  setLoading(true);
+  try {
+    const params = new URLSearchParams();
+    params.set("limit", "200");
+    if (after) {
+      params.set("after", String(after));
+    }
+    const res = await fetch(`${API_ENDPOINTS.MANAGEMENT.LOGS}?${params.toString()}`, { signal });
+    if (!res.ok) {
+      const errorData = await res.json().catch(() => null);
+      const errorMsg = errorData?.error;
+      if (errorMsg === "logging to file disabled") {
+        setLogs([]);
+        setLoading(false);
+        return;
+      }
+      showToast(messages.loadFailed, "error");
+      setLoading(false);
+      return;
+    }
+
+    const data: LogsResponse = await res.json();
+    setDisabled?.(data.disabled === true);
+    const lines = Array.isArray(data.lines) ? data.lines : [];
+    const nextLogs = append && currentLogs ? [...currentLogs, ...lines] : lines;
+    setLogs(nextLogs);
+    setLatestTimestamp(data["latest-timestamp"] ?? null);
+    setLoading(false);
+  } catch {
+    if (signal?.aborted) return;
+    showToast(messages.networkError, "error");
+    setLoading(false);
+  }
+}
+
+function getLogLevel(line: string): LogLevel {
+  const match = line.match(/\[(info|warn|warning|error)\s*\]/i);
+  const normalized = match?.[1]?.toLowerCase();
+  if (normalized === "error") return LOG_LEVEL.ERROR;
+  if (normalized === "warn" || normalized === "warning") return LOG_LEVEL.WARN;
+  if (normalized === "info") return LOG_LEVEL.INFO;
+  return LOG_LEVEL.UNKNOWN;
+}
+
+function getLevelColor(level: LogLevel) {
+  switch (level) {
+    case LOG_LEVEL.ERROR:
+      return "text-red-400";
+    case LOG_LEVEL.WARN:
+      return "text-yellow-300";
+    case LOG_LEVEL.INFO:
+      return "text-blue-300";
+    default:
+      return "text-zinc-300";
+  }
+}
+
+export default function LogsPage() {
+  const [disabled, setDisabled] = useState(false);
+  const tn = useTranslations("native");
+  const [logs, setLogs] = useState<string[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [latestTimestamp, setLatestTimestamp] = useState<number | null>(null);
+  const [showConfirm, setShowConfirm] = useState(false);
+  const [currentPage, setCurrentPage] = useState(1);
+  const { showToast } = useToast();
+  const t = useTranslations('logs');
+  const logsRef = useRef<string[]>([]);
+  const latestTimestampRef = useRef<number | null>(null);
+  const loadingRef = useRef<boolean>(true);
+
+  const totalPages = Math.ceil(logs.length / LOGS_PER_PAGE);
+  const pagedLogs = logs.slice(
+    (currentPage - 1) * LOGS_PER_PAGE,
+    currentPage * LOGS_PER_PAGE
+  );
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void fetchLogs({ setDisabled, setLogs, setLatestTimestamp, setLoading, showToast, messages: { loadFailed: t('toastLoadFailed'), networkError: t('toastNetworkError') }, signal: controller.signal });
+    return () => controller.abort();
+  }, [showToast, t]);
+
+  useEffect(() => {
+    logsRef.current = logs;
+  }, [logs]);
+
+  useEffect(() => {
+    latestTimestampRef.current = latestTimestamp;
+  }, [latestTimestamp]);
+
+  useEffect(() => {
+    loadingRef.current = loading;
+  }, [loading]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const interval = window.setInterval(() => {
+      if (loadingRef.current) return;
+      void fetchLogs({
+        setDisabled,
+        setLogs,
+        setLatestTimestamp,
+        setLoading,
+        showToast,
+        messages: { loadFailed: t('toastLoadFailed'), networkError: t('toastNetworkError') },
+        after: latestTimestampRef.current,
+        append: true,
+        currentLogs: logsRef.current,
+        signal: controller.signal,
+      });
+    }, 10000);
+
+    return () => {
+      controller.abort();
+      window.clearInterval(interval);
+    };
+  }, [showToast, t]);
+
+  const handleRefresh = () => {
+    setCurrentPage(1);
+    void fetchLogs({
+      setDisabled,
+      setLogs,
+      setLatestTimestamp,
+      setLoading,
+      showToast,
+      messages: { loadFailed: t('toastLoadFailed'), networkError: t('toastNetworkError') },
+      after: latestTimestamp,
+      append: true,
+      currentLogs: logs,
+    });
+  };
+
+  const confirmClear = () => {
+    setShowConfirm(true);
+  };
+
+  const handleClearLogs = async () => {
+    setLoading(true);
+    try {
+      const res = await fetch(API_ENDPOINTS.MANAGEMENT.LOGS, { method: "DELETE" });
+      if (!res.ok) {
+        showToast(t('toastClearFailed'), "error");
+        setLoading(false);
+        return;
+      }
+      setLogs([]);
+      setLatestTimestamp(null);
+      setCurrentPage(1);
+      setLoading(false);
+      showToast(t('toastCleared'), "success");
+    } catch {
+      showToast(t('toastNetworkError'), "error");
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="space-y-4">
+      <section className="rounded-lg border border-[var(--surface-border)] bg-[var(--surface-base)] p-4">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <h1 className="text-xl font-semibold tracking-tight text-[var(--text-primary)]">{t('pageTitle')}</h1>
+        {disabled && <p className="mt-1 text-xs text-[var(--text-muted)]">{tn("loggingDisabled")}</p>}
+        <div className="flex flex-wrap items-center gap-2">
+          <Button onClick={handleRefresh} disabled={loading} className="px-2.5 py-1 text-xs">
+            {t('refreshButton')}
+          </Button>
+          <Button onClick={confirmClear} disabled={loading} className="px-2.5 py-1 text-xs">
+            {t('clearLogsButton')}
+          </Button>
+        </div>
+      </div>
+      </section>
+
+      <ConfirmDialog
+        isOpen={showConfirm}
+        onClose={() => setShowConfirm(false)}
+        onConfirm={handleClearLogs}
+        title={t('clearAllLogsTitle')}
+        message={t('clearAllLogsMessage')}
+        confirmLabel={t('clearButton')}
+        cancelLabel={t('cancelButton')}
+        variant="danger"
+      />
+
+      <section className="rounded-lg border border-[var(--surface-border)] bg-[var(--surface-base)] p-4">
+        <h2 className="mb-3 text-sm font-semibold text-[var(--text-primary)]">{t('recentLogsTitle')}</h2>
+          {loading ? (
+            <div className="p-4 text-center text-[var(--text-muted)]">{t('loadingText')}</div>
+          ) : logs.length === 0 ? (
+              <div className="rounded-sm border border-[var(--surface-border)] bg-[var(--surface-base)] p-4 text-sm text-[var(--text-muted)]">
+                {t('logsEmptyProxy')}
+                <code className="rounded bg-[var(--surface-muted)] px-1">logging-to-file</code>
+              </div>
+          ) : (
+            <div
+              className="max-h-[clamp(300px,60vh,700px)] overflow-y-auto rounded-sm border border-[var(--surface-border)] bg-[#1a1a1a] p-4 font-mono text-xs text-gray-200"
+            >
+              <div className="space-y-1">
+                {pagedLogs.map((line, index) => {
+                  const level = getLogLevel(line);
+                  return (
+                    <div key={`${(currentPage - 1) * LOGS_PER_PAGE + index}-${line}`} className={`${getLevelColor(level)} break-all`}>
+                      {line}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+          {totalPages > 1 && (
+            <div className="mt-3 flex items-center justify-between">
+              <Button
+                variant="ghost"
+                onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
+                disabled={currentPage === 1}
+                className="px-2.5 py-1 text-xs"
+              >
+                {t('previous')}
+              </Button>
+              <span className="text-xs text-[var(--text-muted)]">
+                {t('pageOf', { page: currentPage, total: totalPages })}
+              </span>
+              <Button
+                variant="ghost"
+                onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
+                disabled={currentPage === totalPages}
+                className="px-2.5 py-1 text-xs"
+              >
+                {t('next')}
+              </Button>
+            </div>
+          )}
+      </section>
+
+      <div className="rounded-lg border border-[var(--surface-border)] bg-[var(--surface-base)] p-4 text-xs text-[var(--text-muted)]">
+        <strong>{t('tipLabel')}</strong> {t('tipText')}
+      </div>
+    </div>
+  );
+}

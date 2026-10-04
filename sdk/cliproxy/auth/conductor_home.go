@@ -1310,6 +1310,23 @@ func (m *Manager) findAllAntigravityCreditsCandidateAuths(ctx context.Context, r
 	m.mu.RUnlock()
 
 	var known []creditsCandidateEntry
+	if m.candidatePolicy.Load() != nil {
+		auths := make([]*Auth, 0, len(candidates))
+		for _, candidate := range candidates {
+			auths = append(auths, candidate.auth)
+		}
+		allowed, err := m.filterCandidates(ctx, routeModel, opts, auths)
+		if err != nil {
+			return nil, err
+		}
+		filtered := candidates[:0]
+		for _, candidate := range candidates {
+			if pickSchedulerAuthByID(allowed, candidate.auth.ID) != nil {
+				filtered = append(filtered, candidate)
+			}
+		}
+		candidates = filtered
+	}
 	var unknown []creditsCandidateEntry
 	for _, candidate := range candidates {
 		hint, okHint, errHint := GetAntigravityCreditsHintRequired(ctx, candidate.auth.ID)

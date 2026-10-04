@@ -39,3 +39,8 @@ bin
 .bmad
 _bmad
 _bmad-output
+web/node_modules
+web/dist
+dashboard/node_modules
+dashboard/dist
+data

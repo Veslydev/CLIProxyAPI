@@ -38,6 +38,7 @@ type oauthSession struct {
 	Source    string
 	Metadata  map[string]any
 	Completed bool
+	Saving    bool
 	CreatedAt time.Time
 	ExpiresAt time.Time
 }
@@ -220,7 +221,7 @@ func (s *oauthSessionStore) IsPending(state, provider string) bool {
 	if !ok {
 		return false
 	}
-	if session.Completed || session.Status != "" {
+	if session.Completed || session.Saving || session.Status != "" {
 		return false
 	}
 	if provider == "" {
@@ -243,10 +244,23 @@ func (s *oauthSessionStore) Cancel(state string) bool {
 
 	s.purgeExpiredLocked(now)
 	session, ok := s.sessions[state]
-	if !ok || session.Completed || session.Status != "" {
+	if !ok || session.Completed || session.Saving || session.Status != "" {
 		return false
 	}
 	delete(s.sessions, state)
+	return true
+}
+
+func (s *oauthSessionStore) claimSave(state, provider string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.purgeExpiredLocked(time.Now())
+	v, ok := s.sessions[state]
+	if !ok || v.Completed || v.Saving || v.Status != "" || v.Provider != provider {
+		return false
+	}
+	v.Saving = true
+	s.sessions[state] = v
 	return true
 }
 

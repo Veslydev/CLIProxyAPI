@@ -487,6 +487,7 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 	var requestCtx context.Context
 	if c != nil && c.Request != nil {
 		requestCtx = c.Request.Context()
+		parentCtx = coreauth.CopyPolicyRequestContext(parentCtx, requestCtx)
 	}
 
 	if requestCtx != nil && logging.GetRequestID(parentCtx) == "" {

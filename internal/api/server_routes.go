@@ -364,6 +364,10 @@ func (s *Server) codexAlphaSearch(c *gin.Context) {
 		return
 	}
 	selectionOpts := coreexecutor.Options{Headers: selectionHeaders, OriginalRequest: body}
+	if errAdmission := s.handlers.AuthManager.AdmitRequest(ctx, coreexecutor.Request{Model: selectionModel, Payload: body}, selectionOpts); errAdmission != nil {
+		c.JSON(clienterror.HTTPStatusFromErrorOr(errAdmission, http.StatusServiceUnavailable), gin.H{"error": errAdmission.Error()})
+		return
+	}
 	var selection *auth.HomeDispatchSelection
 	var selected *auth.Auth
 	if s.handlers.AuthManager.HomeEnabled() {
@@ -415,6 +419,11 @@ func (s *Server) codexAlphaSearch(c *gin.Context) {
 		defer releaseAttempt()
 	}
 	logging.SetGinCPATraceID(c, selected.EnsureIndex())
+	ctx, finishUsage := s.trackControlPlaneHTTP(c, ctx, selected, selectionModel)
+	var usageHeaders http.Header
+	defer func() { finishUsage(usageHeaders) }()
+	releaseExecution := s.handlers.AuthManager.BeginExecution(ctx, selected, selectionOpts)
+	defer releaseExecution()
 
 	baseHeaders := make(http.Header)
 	baseHeaders.Set("Content-Type", "application/json")
@@ -495,6 +504,7 @@ func (s *Server) codexAlphaSearch(c *gin.Context) {
 		c.JSON(clienterror.HTTPStatusFromErrorOr(err, http.StatusBadGateway), gin.H{"error": err.Error()})
 		return
 	}
+	usageHeaders = resp.Header.Clone()
 	closeResponseBody := func() error {
 		errClose := resp.Body.Close()
 		if errClose != nil {

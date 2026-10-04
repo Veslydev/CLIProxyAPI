@@ -2043,7 +2043,7 @@ func TestSessionAffinitySelector_CrossProviderIsolation(t *testing.T) {
 func TestSessionCache_GetAndRefresh(t *testing.T) {
 	t.Parallel()
 
-	cache := NewSessionCache(100 * time.Millisecond)
+	cache := NewSessionCache(time.Hour)
 	defer cache.Stop()
 
 	cache.Set("session1", "auth1")
@@ -2054,23 +2054,31 @@ func TestSessionCache_GetAndRefresh(t *testing.T) {
 		t.Fatalf("GetAndRefresh() = %q, %v, want auth1, true", got, ok)
 	}
 
-	// Wait half TTL and access again (should refresh)
-	time.Sleep(60 * time.Millisecond)
+	// Move the watermark directly. Scheduler delays are not a clock fixture.
+	setExpiration := func(expires time.Time) {
+		cache.mu.Lock()
+		defer cache.mu.Unlock()
+		entry := cache.entries["session1"]
+		cache.replaceAliasGroupsLocked(entry.authID, expires, entry.aliases, entry)
+	}
+	beforeRefresh := time.Now().Add(time.Minute)
+	setExpiration(beforeRefresh)
 	got, ok = cache.GetAndRefresh("session1")
 	if !ok || got != "auth1" {
-		t.Fatalf("GetAndRefresh() after 60ms = %q, %v, want auth1, true", got, ok)
+		t.Fatalf("GetAndRefresh() before expiry = %q, %v, want auth1, true", got, ok)
 	}
-
-	// Wait another 60ms (total 120ms from original, but TTL refreshed at 60ms)
-	// Entry should still be valid because TTL was refreshed
-	time.Sleep(60 * time.Millisecond)
+	cache.mu.RLock()
+	refreshed := cache.entries["session1"].expiresAt
+	cache.mu.RUnlock()
+	if !refreshed.After(beforeRefresh) {
+		t.Fatal("GetAndRefresh did not extend expiration")
+	}
 	got, ok = cache.GetAndRefresh("session1")
 	if !ok || got != "auth1" {
 		t.Fatalf("GetAndRefresh() after refresh = %q, %v, want auth1, true (TTL should have been refreshed)", got, ok)
 	}
 
-	// Now wait full TTL without access
-	time.Sleep(110 * time.Millisecond)
+	setExpiration(time.Now().Add(-time.Hour))
 	got, ok = cache.GetAndRefresh("session1")
 	if ok {
 		t.Fatalf("GetAndRefresh() after expiry = %q, %v, want '', false", got, ok)

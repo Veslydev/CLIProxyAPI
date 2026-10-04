@@ -150,7 +150,7 @@ func TestPionMediaRelayBridgesAudioAndDataChannel(t *testing.T) {
 		logger.ReplaceHooks(previousHooks)
 		logger.SetLevel(previousLevel)
 	}()
-	clientAPI := newTestWebRTCAPI(t)
+	clientAPI := newTestLoopbackWebRTCAPI(t)
 	client, errClient := clientAPI.NewPeerConnection(webrtc.Configuration{})
 	if errClient != nil {
 		t.Fatalf("create client PeerConnection: %v", errClient)
@@ -195,6 +195,10 @@ func TestPionMediaRelayBridgesAudioAndDataChannel(t *testing.T) {
 	if errRelay != nil {
 		t.Fatalf("create media relay: %v", errRelay)
 	}
+	// This is an in-process bridge test, not host-interface reachability coverage.
+	// Docker/veth-heavy hosts otherwise produce thousands of irrelevant ICE pairs.
+	relay.downstreamAPI = newTestLoopbackWebRTCAPI(t)
+	relay.upstreamAPI = newTestLoopbackWebRTCAPI(t)
 	session, relayOffer, errSession := relay.NewSession(context.Background(), clientOffer, mediaSessionRoute{
 		credential: "Voice credential",
 		authIndex:  "auth-index",
@@ -216,7 +220,7 @@ func TestPionMediaRelayBridgesAudioAndDataChannel(t *testing.T) {
 		t.Fatal("reloaded media relay bypassed the shared session capacity")
 	}
 
-	upstreamAPI := newTestWebRTCAPI(t)
+	upstreamAPI := newTestLoopbackWebRTCAPI(t)
 	upstream, errUpstream := upstreamAPI.NewPeerConnection(webrtc.Configuration{})
 	if errUpstream != nil {
 		t.Fatalf("create upstream PeerConnection: %v", errUpstream)
@@ -371,6 +375,15 @@ func newTestWebRTCAPI(t *testing.T) *webrtc.API {
 		webrtc.WithMediaEngine(mediaEngine),
 		webrtc.WithInterceptorRegistry(interceptorRegistry),
 	)
+}
+
+func newTestLoopbackWebRTCAPI(t *testing.T) *webrtc.API {
+	t.Helper()
+	api, err := newPionAPIWithOptions(config.CodexLiveMediaRelayConfig{}, false, true)
+	if err != nil {
+		t.Fatalf("create loopback WebRTC API: %v", err)
+	}
+	return api
 }
 
 func completeOffer(t *testing.T, connection *webrtc.PeerConnection) string {

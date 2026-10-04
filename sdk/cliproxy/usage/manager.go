@@ -292,6 +292,13 @@ type Plugin interface {
 	HandleUsage(ctx context.Context, record Record)
 }
 
+// SynchronousPlugin settles durable accounting before Publish returns. Ordinary
+// telemetry plugins retain their asynchronous delivery and ordering semantics.
+type SynchronousPlugin interface {
+	Plugin
+	SynchronousUsage() bool
+}
+
 type queueItem struct {
 	ctx    context.Context
 	record Record
@@ -406,6 +413,20 @@ func (m *Manager) Publish(ctx context.Context, record Record) {
 		}
 	}
 	// ensure worker is running even if Start was not called explicitly
+	m.mu.Lock()
+	closed := m.closed
+	m.mu.Unlock()
+	if closed {
+		return
+	}
+	m.pluginsMu.RLock()
+	plugins := append([]Plugin(nil), m.plugins...)
+	m.pluginsMu.RUnlock()
+	for _, plugin := range plugins {
+		if synchronous, ok := plugin.(SynchronousPlugin); ok && synchronous.SynchronousUsage() {
+			safeInvoke(plugin, ctx, record)
+		}
+	}
 	m.Start(context.Background())
 	m.mu.Lock()
 	if m.closed {
@@ -444,6 +465,9 @@ func (m *Manager) dispatch(item queueItem) {
 	}
 	for _, plugin := range plugins {
 		if plugin == nil {
+			continue
+		}
+		if synchronous, ok := plugin.(SynchronousPlugin); ok && synchronous.SynchronousUsage() {
 			continue
 		}
 		safeInvoke(plugin, item.ctx, item.record)

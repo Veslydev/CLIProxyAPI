@@ -990,6 +990,11 @@ func (m *Manager) pickViaPluginScheduler(ctx context.Context, scheduler PluginSc
 	if !okStrategy {
 		return nil, false, nil
 	}
+	if m.candidatePolicy.Load() != nil {
+		// Delegating to the full scheduler would discard the authorized subset.
+		// Fall back to the configured selector over the already filtered candidates.
+		return nil, false, nil
+	}
 	return m.pickViaBuiltinScheduler(ctx, strategy, providerKey, providers, model, opts, tried)
 }
 
@@ -1635,7 +1640,7 @@ func (m *Manager) CloseExecutionSession(sessionID string) {
 }
 
 func (m *Manager) useSchedulerFastPath() bool {
-	if m == nil || m.scheduler == nil {
+	if m == nil || m.scheduler == nil || m.candidatePolicy.Load() != nil {
 		return false
 	}
 	return isBuiltInSelector(m.Selector())
@@ -1727,6 +1732,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 
 	opts.EnsureMetadata()
 	opts.Metadata[cliproxyexecutor.SessionAffinityProviderMetadataKey] = provider
+	opts.Metadata[cliproxyexecutor.CandidateProvidersMetadataKey] = []string{provider}
 
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 	eligibility := authSelectionEligibilityForRequest(ctx, opts)
@@ -1769,6 +1775,12 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		}
 		candidates = append(candidates, candidate)
 	}
+	var errPolicy error
+	candidates, errPolicy = m.filterCandidates(ctx, model, opts, candidates)
+	if errPolicy != nil {
+		m.mu.RUnlock()
+		return nil, nil, errPolicy
+	}
 	if len(candidates) == 0 {
 		m.mu.RUnlock()
 		return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available"}
@@ -1799,6 +1811,9 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	}
 	if selected == nil {
 		return nil, nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
+	}
+	if m.candidatePolicy.Load() != nil && pickSchedulerAuthByID(available, selected.ID) == nil {
+		return nil, nil, &Error{Code: "scope_violation", Message: "selector returned an unauthorized credential", HTTPStatus: http.StatusForbidden}
 	}
 	authCopy := selected.Clone()
 	if !selected.indexAssigned {
@@ -2045,6 +2060,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 
 	opts.EnsureMetadata()
 	opts.Metadata[cliproxyexecutor.SessionAffinityProviderMetadataKey] = "mixed"
+	opts.Metadata[cliproxyexecutor.CandidateProvidersMetadataKey] = append([]string(nil), providers...)
 
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 	eligibility := authSelectionEligibilityForRequest(ctx, opts)
@@ -2103,6 +2119,12 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		}
 		candidates = append(candidates, candidate)
 	}
+	var errPolicy error
+	candidates, errPolicy = m.filterCandidates(ctx, model, opts, candidates)
+	if errPolicy != nil {
+		m.mu.RUnlock()
+		return nil, nil, "", errPolicy
+	}
 	if len(candidates) == 0 {
 		m.mu.RUnlock()
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
@@ -2133,6 +2155,9 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	}
 	if selected == nil {
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "selector returned no auth"}
+	}
+	if m.candidatePolicy.Load() != nil && pickSchedulerAuthByID(available, selected.ID) == nil {
+		return nil, nil, "", &Error{Code: "scope_violation", Message: "selector returned an unauthorized credential", HTTPStatus: http.StatusForbidden}
 	}
 	providerKey := executorKeyFromAuth(selected)
 	executor, okExecutor := m.Executor(providerKey)

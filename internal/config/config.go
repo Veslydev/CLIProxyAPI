@@ -6,7 +6,8 @@ package config
 
 // Config represents the application's configuration, loaded from a YAML file.
 type Config struct {
-	SDKConfig `yaml:",inline"`
+	SDKConfig    `yaml:",inline"`
+	ControlPlane ControlPlaneConfig `yaml:"control-plane" json:"control-plane"`
 	// Host is the network host/interface on which the API server will bind.
 	// Default is empty ("") to bind all interfaces (IPv4 + IPv6). Use "127.0.0.1" or "localhost" for local-only access.
 	Host string `yaml:"host" json:"-"`
@@ -190,4 +191,14 @@ type Config struct {
 
 	// Payload defines default and override rules for provider payload parameters.
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
+}
+
+// ControlPlaneConfig enables the durable local management plane.
+type ControlPlaneConfig struct {
+	Enabled                 bool   `yaml:"enabled" json:"enabled"`
+	Database                string `yaml:"database" json:"database"`
+	AdminSecretEnv          string `yaml:"admin-secret-env" json:"admin-secret-env"`
+	DashboardFile           string `yaml:"dashboard-file" json:"dashboard-file"`
+	OperationsDashboardFile string `yaml:"operations-dashboard-file" json:"operations-dashboard-file"`
+	RetentionDays           int    `yaml:"retention-days" json:"retention-days"`
 }

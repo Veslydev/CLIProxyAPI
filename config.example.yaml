@@ -81,6 +81,16 @@ management:
   # GitHub repository for the management control panel. Accepts a repository URL or releases API URL.
   panel-github-repository: "https://github.com/router-for-me/Cli-Proxy-API-Management-Center"
 
+  # Built-in persistent control plane; disabled preserves upstream behavior.
+  # Set the separate CONTROL_PLANE_ADMIN_SECRET to at least 32 random bytes.
+  control-plane:
+    enabled: false
+    database: data/controlplane.sqlite
+    admin-secret-env: CONTROL_PLANE_ADMIN_SECRET
+    dashboard-file: dashboard/dist/index.html
+    operations-dashboard-file: web/dist/index.html
+    retention-days: 30
+
 # Client authentication for the proxy API. These are not upstream provider keys.
 access:
   # API keys for authentication
